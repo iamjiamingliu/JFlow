@@ -47,7 +47,13 @@ Creating congratulations
 2. Auto type hints for results returned by `Depends`
 3. Intuitive, simple to use
 
-## What Happens Behind the Scene
+## Limitations
+1. It is `end_goals` oriented. Only tasks that facilitate the ultimate execution of `end_goals` will be executed
+2. It doesn't track state, it doesn't have any UI, it doesn't have any error recovery
+
+> JFlow basically only help you run the `end_goals` and their dependencies recursively. Nothing else
+
+## What's Happening Behind the Scene
 When you create an instance of `Workflow`:
 1. You pass in a few `end_goals`
 2. JFlow recursively analyzes the dependencies starting from the `end_goals` to come up with an execution plan
