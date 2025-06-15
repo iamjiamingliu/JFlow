@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from collections import deque
+from collections import defaultdict
 from typing import (
     Any,
     Awaitable,
@@ -15,105 +15,101 @@ class Workflow:
         self,
         end_goals: Sequence[Callable[..., Awaitable[Any]]],
     ) -> None:
-        """
-        :param end_goals: one or more async functions you ultimately want to run.
-                           Their parameters should be defaulted to Depends(some_fn).
-        """
         self.end_goals = list(end_goals)
 
-        # Build the full DAG of functions → their dependencies
+        # build dependency map: fn -> [its dependency functions]
         self._deps: Dict[Callable[..., Awaitable[Any]], Sequence[Callable[..., Awaitable[Any]]]] = {}
         for fn in self.end_goals:
             self._build_deps(fn)
 
-        # Pre‐compute a topological ordering
-        self._topo = self._topological_sort(self._deps)
+        # build reverse map: fn -> [functions that depend on fn]
+        self._dependents: Dict[Callable[..., Awaitable[Any]], Sequence[Callable[..., Awaitable[Any]]]] = defaultdict(list)
+        for fn, deps in self._deps.items():
+            for d in deps:
+                self._dependents[d].append(fn)
 
     def _build_deps(self, fn: Callable[..., Awaitable[Any]]) -> None:
-        # If we've already processed this node, skip.
         if fn in self._deps:
             return
-
         sig = inspect.signature(fn)
         deps = []
         for param in sig.parameters.values():
             default = param.default
-            # detect our Depends‐sentinel by duck-typing
             if hasattr(default, "dependency") and asyncio.iscoroutinefunction(default.dependency):
-                dep_fn = default.dependency  # the underlying async function
+                dep_fn = default.dependency
                 deps.append(dep_fn)
                 self._build_deps(dep_fn)
-
         self._deps[fn] = deps
-
-    def _topological_sort(
-        self,
-        deps: Dict[Callable[..., Awaitable[Any]], Sequence[Callable[..., Awaitable[Any]]]]
-    ) -> Sequence[Callable[..., Awaitable[Any]]]:
-        # Kahn’s algorithm
-        in_degree: Dict[Callable[..., Awaitable[Any]], int] = {
-            fn: len(dlist) for fn, dlist in deps.items()
-        }
-        queue = deque(fn for fn, deg in in_degree.items() if deg == 0)
-        order: list[Callable[..., Awaitable[Any]]] = []
-
-        while queue:
-            node = queue.popleft()
-            order.append(node)
-            # “Remove” edges from node → its dependents
-            for succ, succ_deps in deps.items():
-                if node in succ_deps:
-                    in_degree[succ] -= 1
-                    if in_degree[succ] == 0:
-                        queue.append(succ)
-
-        if len(order) != len(deps):
-            raise RuntimeError("Cyclic dependency detected in workflow!")
-        return order
 
     async def run(
         self,
         initial_inputs: Sequence[Awaitable[Any]],
     ) -> Tuple[Any, ...]:
-        """
-        :param initial_inputs: coroutines for any root funcs you’ve already called,
-                               e.g. [create_person(name="Joe")].
-        :returns: a tuple of results in the same order as end_goals.
-        """
-        # 1) Seed any pre‐computed inputs
-        seeded: Dict[str, Any] = {}
-        coros = list(initial_inputs)
-        if coros:
-            results = await asyncio.gather(*coros)
-            for coro, res in zip(coros, results):
-                # match by the function name of the coroutine object
-                fn_name = coro.cr_code.co_name
-                seeded[fn_name] = res
-
-        # 2) Execute the DAG in topo order
+        # 1) Seed any initial inputs
         cache: Dict[Callable[..., Awaitable[Any]], Any] = {}
-        for fn in self._topo:
-            name = fn.__name__
-            if name in seeded:
-                cache[fn] = seeded[name]
-                continue
+        if initial_inputs:
+            results = await asyncio.gather(*initial_inputs)
+            for coro, res in zip(initial_inputs, results):
+                fn_name = coro.cr_code.co_name
+                # find the matching function object by name
+                for fn in self._deps:
+                    if fn.__name__ == fn_name:
+                        cache[fn] = res
+                        break
 
-            # collect args from cache based on Depends defaults
-            sig = inspect.signature(fn)
-            kwargs: Dict[str, Any] = {}
-            for param in sig.parameters.values():
-                default = param.default
-                if hasattr(default, "dependency") and asyncio.iscoroutinefunction(default.dependency):
-                    dep_fn = default.dependency
-                    kwargs[param.name] = cache[dep_fn]
-                elif default is inspect._empty:
-                    raise RuntimeError(f"Missing value for required {param.name!r} in {fn.__name__}")
-                else:
-                    # literal/defaulted param
-                    kwargs[param.name] = default
+        # 2) Compute how many unsatisfied deps each fn has
+        rem_deps: Dict[Callable[..., Awaitable[Any]], int] = {
+            fn: sum(1 for d in deps if d not in cache)
+            for fn, deps in self._deps.items()
+        }
 
-            # await the async function
-            cache[fn] = await fn(**kwargs)
+        # 3) Kick off all initially-ready (dep‐free) tasks
+        task_to_fn: Dict[asyncio.Task, Callable[..., Awaitable[Any]]] = {}
+        running: Dict[Callable[..., Awaitable[Any]], asyncio.Task] = {}
+        for fn, count in rem_deps.items():
+            if count == 0 and fn not in cache:
+                task = asyncio.create_task(self._exec(fn, cache))
+                running[fn] = task
+                task_to_fn[task] = fn
 
-        # 3) Gather the end‐goal results in order
+        # 4) As tasks complete, schedule their dependents
+        while running:
+            done, _ = await asyncio.wait(
+                running.values(), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                fn = task_to_fn.pop(task)
+                result = task.result()
+                cache[fn] = result
+                running.pop(fn)
+
+                # decrement remaining deps for each dependent
+                for dep_fn in self._dependents.get(fn, []):
+                    rem_deps[dep_fn] -= 1
+                    if rem_deps[dep_fn] == 0:
+                        # now ready to run
+                        t2 = asyncio.create_task(self._exec(dep_fn, cache))
+                        running[dep_fn] = t2
+                        task_to_fn[t2] = dep_fn
+
+        # 5) Return results of the end_goals in order
         return tuple(cache[fn] for fn in self.end_goals)
+
+    async def _exec(
+        self,
+        fn: Callable[..., Awaitable[Any]],
+        cache: Dict[Callable[..., Awaitable[Any]], Any],
+    ) -> Any:
+        """Gather args from cache and await fn(...)"""
+        sig = inspect.signature(fn)
+        kwargs: Dict[str, Any] = {}
+        for param in sig.parameters.values():
+            default = param.default
+            if hasattr(default, "dependency") and asyncio.iscoroutinefunction(default.dependency):
+                dep_fn = default.dependency
+                kwargs[param.name] = cache[dep_fn]
+            elif default is not inspect._empty:
+                kwargs[param.name] = default
+            else:
+                raise RuntimeError(f"Missing required param {param.name} for {fn.__name__!r}")
+        return await fn(**kwargs)
