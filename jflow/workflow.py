@@ -12,7 +12,6 @@ from typing import (
 )
 
 Func = Callable[..., Awaitable[Any]]
-MaybeAwaitable = Union[Any, Awaitable[Any]]
 
 
 class Workflow:
@@ -30,15 +29,6 @@ class Workflow:
         for fn, deps in self._deps.items():
             for d in deps:
                 self._dependents[d].append(fn)
-        # Store user‐provided entry points
-        self._entry_points: Dict[Func, MaybeAwaitable] = {}
-
-    def add_entry_point(self, fn: Func, value: MaybeAwaitable) -> None:
-        """
-        Seed `fn` with either an already‐computed value, or an awaitable that
-        returns its value.
-        """
-        self._entry_points[fn] = value
 
     def _build_deps(self, fn: Func) -> None:
         if fn in self._deps:
@@ -53,14 +43,12 @@ class Workflow:
                 self._build_deps(dep_fn)
         self._deps[fn] = deps
 
-    async def run(self) -> Tuple[Any, ...]:
+    async def run(self, entry_points: Dict[Func, Any]) -> Tuple[Any, ...]:
         # 1) Seed cache with entry points
+        entry_point_results = await asyncio.gather(*[fn(*args) for fn, args in entry_points.items()])
         cache: Dict[Func, Any] = {}
-        for fn, val in self._entry_points.items():
-            if inspect.isawaitable(val):
-                cache[fn] = await val  # await coroutine
-            else:
-                cache[fn] = val  # concrete value
+        for (fn, args), res in zip(entry_points.items(), entry_point_results):
+            cache[fn] = res
 
         # 2) Count unmet dependencies for every fn
         rem_deps: Dict[Func, int] = {
@@ -94,7 +82,8 @@ class Workflow:
         # 5) Collect and return end‐goal results in order
         return tuple(cache[fn] for fn in self.end_goals)
 
-    async def _execute(self, fn: Func, cache: Dict[Func, Any]) -> Any:
+    @staticmethod
+    async def _execute(fn: Func, cache: Dict[Func, Any]) -> Any:
         """
         Gathers kwargs for `fn` from cache (via Depends) or defaults,
         then awaits it.

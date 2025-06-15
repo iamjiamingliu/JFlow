@@ -24,10 +24,7 @@ async def say_hi_twice(p=Depends(create_person), blessing=Depends(create_hi)) ->
 
 async def main():
     workflow = Workflow(say_hi, say_hi_twice)
-    workflow.add_entry_point(create_person, create_person(person_name='Joe Mama'))
-    # Alternatively, you can provide a value directly!
-    # workflow.add_entry_point(create_person, {'name': 'Joe Mama'})
-    result1, result2 = await workflow.run()
+    result1, result2 = await workflow.run(entry_points={create_person: ['Joe Mama',]})
     print(result1, result2)
 
 asyncio.run(main())
