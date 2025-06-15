@@ -10,36 +10,35 @@ from jflow import Depends, Workflow
 async def create_person(person_name: str) -> dict:
     return {'name': person_name}
 
-async def create_congratulation(p=Depends(create_person)) -> str:
-    print('Creating congratulations')
-    return 'Congratulations ' + p['name']
+async def create_hi(p=Depends(create_person)) -> str:
+    print('Creating hi')
+    return 'Hi ' + p['name']
 
-async def say_congratulation(p=Depends(create_person), blessing=Depends(create_congratulation)) -> int:
+async def say_hi(p=Depends(create_person), blessing=Depends(create_hi)) -> int:
     print(p, blessing, 'Once')
     return 1
 
-async def say_congratulation_twice(p=Depends(create_person), blessing=Depends(create_congratulation)) -> int:
-    print(p, blessing, 'Twice')
+async def say_hi_twice(p=Depends(create_person), blessing=Depends(create_hi)) -> int:
     print(p, blessing, 'Twice')
     return 2
 
 async def main():
-    congratulation_workflow = Workflow(end_goals=[say_congratulation, say_congratulation_twice])
-    say_congratulation_result, say_congratulation_twice_result = await congratulation_workflow.run(
-        initial_inputs=[create_person(person_name='Joe Mama')]
-    )
-    print(say_congratulation_result, say_congratulation_twice_result)
+    workflow = Workflow(say_hi, say_hi_twice)
+    workflow.add_entry_point(create_person, create_person(person_name='Joe Mama'))
+    # Alternatively, you can provide a value directly!
+    # workflow.add_entry_point(create_person, {'name': 'Joe Mama'})
+    result1, result2 = await workflow.run()
+    print(result1, result2)
 
 asyncio.run(main())
 ```
 
 Expected Output:
 ```text
-Creating congratulations
-{'name': 'Joe Mama'} Congratulations Joe Mama Once
-{'name': 'Joe Mama'} Congratulations Joe Mama Twice
-{'name': 'Joe Mama'} Congratulations Joe Mama Twice
-1, 2
+Creating hi
+{'name': 'Joe Mama'} Hi Joe Mama Once
+{'name': 'Joe Mama'} Hi Joe Mama Twice
+1 2
 ```
 
 ## Key Benefits
@@ -47,21 +46,17 @@ Creating congratulations
 2. Auto type hints for results returned by `Depends`
 3. Intuitive, simple to use
 
-## Limitations
-1. It is `end_goals` oriented. Only tasks that facilitate the ultimate execution of `end_goals` will be executed
-2. It doesn't track state, it doesn't have any UI, it doesn't have any error recovery
-
-> JFlow basically only help you run the `end_goals` and their dependencies recursively. Nothing else
-
 ## What's Happening Behind the Scene
 When you create an instance of `Workflow`:
-1. You pass in a few `end_goals`
+1. You pass in a few `end_goals` into `WorkFlow`. In the example, the `end_goals` are `say_hi` and `say_hi_twice`
 2. JFlow recursively analyzes the dependencies starting from the `end_goals` to come up with an execution plan
 
-When you call `run` on the `Workflow` you just created:
-1. JFlow collects the `initial_inputs` and feed them to kick off the execution plan
+You add some `entry points` to `Workflow`, which will be used to kick off the workflow
+
+Finally, when you call `run` on the `Workflow` you just created:
+1. JFlow collects the `entry points` and feed them to actually kick off the execution plan
 2. For every task executed, JFlow tracks its result to avoid duplicate execution
-3. Once all `end_goals` have returned results, finish the workflow and return those end results
+3. Once all `end_goals` have returned results, stop the workflow and return those end results
 
 > In academic jargon, the _execution plan_ is a Directed Acyclic Graph (DAG) data structure
 
